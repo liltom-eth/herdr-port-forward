@@ -175,7 +175,7 @@ export default class PortForward extends View {
     this.machine = null;
     this.error = "";
     this.input = InputState.new({ value: "" });
-    this.input.on("submit", () => this.submit());
+    this.input.on("submit", (_e, cx) => { this.submit(); cx.notify(); });
     this.input.on("change", (_e, cx) => { this.error = ""; cx.notify(); });
     this.handle = cx.focus_handle();
   }
@@ -226,19 +226,19 @@ export default class PortForward extends View {
       .child(st.machines.length ? "No forwarded ports yet. Start a server on a remote machine, or add one." : "Connect an ssh machine to forward its ports.");
     const addBtn = h_flex().id("pf-add").h(30).px(12).items_center().rounded(8).border_1().border_color(t.input).bg(t.raised)
       .text_size(12.5).text_color(t.foreground).cursor_pointer().hover((s) => s.opacity(0.88))
-      .on_click(() => { this.adding = true; this.input.focus(); cx.notify(); }).child("+ Add Port");
+      .on_click((_e, cx) => { this.adding = true; cx.notify(); cx.timer.after(50, () => this.input.focus()); }).child("+ Add Port");
     const chips = multi ? h_flex().gap(6).children(st.machines.map((m) => {
       const on = (this.machine ?? st.machines[0]) === m;
       return div().id(`m-${m}`).h(26).px(8).flex().items_center().rounded(6).text_size(11.5).cursor_pointer()
         .bg(on ? t.solid : t.raised).text_color(on ? t.solid_foreground : t.muted)
-        .on_click(() => { this.machine = m; cx.notify(); }).child(m);
+        .on_click((_e, cx) => { this.machine = m; cx.notify(); }).child(m);
     })) : null;
     const addRow = h_flex().gap(8).items_center()
       .child(Input.new(this.input).w(160).h(30).px(10).rounded(8).border_1().border_color(t.accent).bg(t.background).text_size(12.5).text_color(t.foreground))
       .when(Boolean(chips), (el) => el.child(chips))
       .child(h_flex().id("pf-ok").h(30).px(12).items_center().rounded(8).bg(t.solid).text_color(t.solid_foreground).text_size(12.5)
-        .cursor_pointer().on_click(() => { this.submit(); cx.notify(); }).child("Forward"))
-      .child(div().id("pf-cancel").text_size(12).text_color(t.dim).cursor_pointer().on_click(() => { this.adding = false; cx.notify(); }).child("Cancel"))
+        .cursor_pointer().on_click((_e, cx) => { this.submit(); cx.notify(); }).child("Forward"))
+      .child(div().id("pf-cancel").text_size(12).text_color(t.dim).cursor_pointer().on_click((_e, cx) => { this.adding = false; cx.notify(); }).child("Cancel"))
       .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)));
     return v_flex().id("pf-panel").track_focus(this.handle).size_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
       .on_key_down((e, cx) => { if (e.key === "escape") { if (this.adding) { this.adding = false; cx.notify(); } else closeOverlay(props().overlay); cx.stop_propagation(); } })
