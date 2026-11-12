@@ -1,5 +1,7 @@
 # herdr-port-forward
 
+![Port Forward](preview.png)
+
 Auto port forwarding for [Herdr](https://herdr.dev) ssh machines, like VS Code / Cursor. Click the bar for a Ports panel: port, forwarded address, running process, origin, close buttons and Add Port.
 
 ## Install
