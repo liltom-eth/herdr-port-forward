@@ -237,7 +237,7 @@ export default class PortForward extends View {
       const url = `localhost:${r.local ?? r.port}`;
       return h_flex().id(`r-${r.machine}-${r.port}`).h(34).items_center().text_size(12.5).text_color(t.foreground)
         .hover((s) => s.bg(t.raised))
-        .on_mouse_down("right", () => openOverlay({ mod: "port-forward", kind: "popup", width: 210, height: 118,
+        .on_mouse_down("right", (e) => openOverlay({ mod: "port-forward", kind: "popup", width: 210, height: 118, at: { x: e.position.x, y: e.position.y },
           props: { menu: { machine: r.machine, port: r.port, local: r.local ?? r.port, error: Boolean(r.error) } } }))
         .child(cell(W.port, h_flex().gap(6).items_center().child(div().child(String(r.port)))
           .when(multi, (el) => el.child(div().text_size(10.5).text_color(t.dim).truncate().child(r.machine)))))
