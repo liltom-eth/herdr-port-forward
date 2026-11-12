@@ -43,12 +43,20 @@ function parseListening(text) {
   return out;
 }
 
-const fwdSpec = (p) => `127.0.0.1:${p}:127.0.0.1:${p}`;
+const fwdSpec = (local, remote) => `127.0.0.1:${local}:127.0.0.1:${remote}`;
+
+// requests from the panel/menu to the bar copy (which owns the ssh forwards)
+function sendReq(op, machine, port, extra = {}) {
+  const q = (shared("pf.req") ?? []).slice(-20);
+  q.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, op, machine, port, ...extra });
+  setShared("pf.req", q);
+}
 
 export default class PortForward extends View {
   init(_props, cx) {
-    this.panel = Boolean(props()?.panel);
-    if (this.panel) return this.initPanel(cx);
+    this.mode = props()?.menu ? "menu" : props()?.panel ? "panel" : "bar";
+    if (this.mode === "panel") return this.initPanel(cx);
+    if (this.mode === "menu") return;
     this.m = {};                         // machine -> { target, sock, fwd: Map port -> {origin, error}, closed: Set, listening: Map }
     // requests persist in shared state: ones queued before this copy started are already handled
     this.busy = false; this.again = false; this.seen = new Set((shared("pf.req") ?? []).map((r) => r.id)); this.last = "";
@@ -64,12 +72,13 @@ export default class PortForward extends View {
 
   // ---------- bar side ----------
   async close() {
-    if (this.panel) return;
+    if (this.mode !== "bar") return;
     for (const s of Object.values(this.m ?? {})) await ssh(["-S", s.sock, "-O", "exit", s.target], 3000).catch(() => {});
   }
 
   applyReq(r) {
     const users = (shared("pf.user") ?? []).filter((u) => !(u.machine === r.machine && u.port === r.port));
+    const map = (shared("pf.map") ?? []).filter((u) => !(u.machine === r.machine && u.port === r.port));
     const s = this.m[r.machine];
     if (r.op === "add") {
       users.push({ machine: r.machine, port: r.port });
@@ -79,7 +88,10 @@ export default class PortForward extends View {
     } else if (r.op === "close") {
       s?.closed.add(r.port);
       s?.drop.add(r.port);
+    } else if (r.op === "remap") {
+      map.push({ machine: r.machine, port: r.port, local: r.local });   // sync re-forwards on the new local port
     }
+    setShared("pf.map", map);
     setShared("pf.user", users);
   }
 
@@ -106,7 +118,7 @@ export default class PortForward extends View {
     const rows = [];
     for (const [machine, s] of Object.entries(this.m)) {
       if (!machines.includes(machine)) continue;
-      for (const [port, f] of s.fwd) rows.push({ machine, port, proc: s.listening.get(port) ?? "", origin: f.origin, error: f.error ?? null });
+      for (const [port, f] of s.fwd) rows.push({ machine, port, local: f.local, proc: s.listening.get(port) ?? "", origin: f.origin, error: f.error ?? null });
     }
     rows.sort((a, b) => a.port - b.port);
     const state = { rows, machines };
@@ -144,29 +156,30 @@ export default class PortForward extends View {
       } catch (e) { return; }
     }
 
-    for (const p of s.drop) {                                                    // closed from the panel
-      if (s.fwd.has(p)) await ssh(["-S", s.sock, "-O", "cancel", "-L", fwdSpec(p), s.target], 5000).catch(() => {});
+    const cancel = async (p) => {
+      const f = s.fwd.get(p);
+      if (f && !f.error) await ssh(["-S", s.sock, "-O", "cancel", "-L", fwdSpec(f.local, p), s.target], 5000).catch(() => {});
       s.fwd.delete(p);
-    }
+    };
+    for (const p of s.drop) await cancel(p);                                     // closed from the panel
     s.drop.clear();
 
+    const mapped = new Map((shared("pf.map") ?? []).filter((x) => x.machine === mc.name).map((x) => [x.port, x.local]));
     for (const [p, origin] of want) {
+      const local = mapped.get(p) ?? p;
       const f = s.fwd.get(p);
-      if (f) { f.origin = origin; continue; }
+      if (f && f.local === local) { f.origin = origin; continue; }
+      await cancel(p);                                                           // local port changed: move the forward
       try {
-        await ssh(["-S", s.sock, "-O", "forward", "-L", fwdSpec(p), s.target], 8000);
-        s.fwd.set(p, { origin });
-        if (origin === "auto") notify({ title: `Forwarded port ${p}`, body: `${mc.name} → localhost:${p}`, level: "info" });
+        await ssh(["-S", s.sock, "-O", "forward", "-L", fwdSpec(local, p), s.target], 8000);
+        s.fwd.set(p, { origin, local });
+        if (!f && origin === "auto") notify({ title: `Forwarded port ${p}`, body: `${mc.name} → localhost:${local}`, level: "info" });
       } catch (e) {
-        s.fwd.set(p, { origin, error: String(e.message ?? e).slice(0, 90) });
+        s.fwd.set(p, { origin, local, error: String(e.message ?? e).slice(0, 90) });
         notify({ title: `Couldn't forward ${p}`, body: String(e.message ?? e).slice(0, 120), level: "warning" });
       }
     }
-    for (const [p, f] of [...s.fwd]) {                                           // auto forwards follow the remote server
-      if (want.has(p)) continue;
-      await ssh(["-S", s.sock, "-O", "cancel", "-L", fwdSpec(p), s.target], 5000).catch(() => {});
-      s.fwd.delete(p);
-    }
+    for (const p of [...s.fwd.keys()]) if (!want.has(p)) await cancel(p);        // auto forwards follow the remote server
   }
 
   // ---------- panel side ----------
@@ -178,22 +191,36 @@ export default class PortForward extends View {
     this.input.on("submit", (_e, cx) => { this.submit(); cx.notify(); });
     this.input.on("change", (_e, cx) => { this.error = ""; cx.notify(); });
     this.handle = cx.focus_handle();
+    this.remap = null;                                   // {machine, port, local}: editing a local port
+    this.uiId = shared("pf.ui")?.id;
+    cx.timer.every(150, (cx) => {                        // the right-click menu asks us to edit a port via shared state
+      const u = shared("pf.ui");
+      if (!u?.remap || u.id === this.uiId) return;
+      this.uiId = u.id; this.remap = u.remap; this.adding = false; this.error = "";
+      this.input.set_value(String(u.remap.local));
+      cx.notify();
+      cx.timer.after(50, () => this.input.focus());
+    });
   }
 
-  send(op, machine, port) {
-    const q = (shared("pf.req") ?? []).slice(-20);
-    q.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, op, machine, port });
-    setShared("pf.req", q);
-  }
+  send(op, machine, port, extra) { sendReq(op, machine, port, extra); }
 
   submit() {
+    if (this.remap) {
+      const local = Number(String(this.input.value()).trim().replace(/^.*:/, ""));
+      if (!Number.isInteger(local) || local < 1 || local > 65535) { this.error = "Enter a port from 1 to 65535"; return; }
+      this.send("remap", this.remap.machine, this.remap.port, { local });
+      this.remap = null;
+      this.input.set_value("");
+      return;
+    }
     const state = shared("pf.state") ?? { rows: [], machines: [] };
     const port = Number(String(this.input.value()).trim().replace(/^.*:/, ""));
     const machine = this.machine && state.machines.includes(this.machine) ? this.machine : state.machines[0];
     if (!machine) { this.error = "No ssh machine connected"; return; }
     if (!Number.isInteger(port) || port < 1 || port > 65535) { this.error = "Enter a port from 1 to 65535"; return; }
     this.send("add", machine, port);
-    this.input.set_value?.("");
+    this.input.set_value("");
     this.adding = false;
   }
 
@@ -207,9 +234,11 @@ export default class PortForward extends View {
       .child(cell(W.port, div().child("Port"))).child(cell(W.addr, div().child("Forwarded Address")))
       .child(cell(0, div().child("Running Process"))).child(cell(W.origin, div().child("Origin"))).child(div().w(W.x).flex_none());
     const rows = st.rows.map((r) => {
-      const url = `localhost:${r.port}`;
+      const url = `localhost:${r.local ?? r.port}`;
       return h_flex().id(`r-${r.machine}-${r.port}`).h(34).items_center().text_size(12.5).text_color(t.foreground)
         .hover((s) => s.bg(t.raised))
+        .on_mouse_down("right", () => openOverlay({ mod: "port-forward", kind: "popup", width: 210, height: 118,
+          props: { menu: { machine: r.machine, port: r.port, local: r.local ?? r.port, error: Boolean(r.error) } } }))
         .child(cell(W.port, h_flex().gap(6).items_center().child(div().child(String(r.port)))
           .when(multi, (el) => el.child(div().text_size(10.5).text_color(t.dim).truncate().child(r.machine)))))
         .child(cell(W.addr, r.error
@@ -240,20 +269,41 @@ export default class PortForward extends View {
         .cursor_pointer().on_click((_e, cx) => { this.submit(); cx.notify(); }).child("Forward"))
       .child(div().id("pf-cancel").text_size(12).text_color(t.dim).cursor_pointer().on_click((_e, cx) => { this.adding = false; cx.notify(); }).child("Cancel"))
       .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)));
+    const remapRow = this.remap && h_flex().gap(8).items_center()
+      .child(div().text_size(12).text_color(t.muted).child(`Local port for ${this.remap.port}:`))
+      .child(Input.new(this.input).w(110).h(30).px(10).rounded(8).border_1().border_color(t.accent).bg(t.background).text_size(12.5).text_color(t.foreground))
+      .child(h_flex().id("pf-save").h(30).px(12).items_center().rounded(8).bg(t.solid).text_color(t.solid_foreground).text_size(12.5)
+        .cursor_pointer().on_click((_e, cx) => { this.submit(); cx.notify(); }).child("Save"))
+      .child(div().id("pf-rcancel").text_size(12).text_color(t.dim).cursor_pointer().on_click((_e, cx) => { this.remap = null; this.error = ""; cx.notify(); }).child("Cancel"))
+      .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)));
     return v_flex().id("pf-panel").track_focus(this.handle).size_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
-      .on_key_down((e, cx) => { if (e.key === "escape") { if (this.adding) { this.adding = false; cx.notify(); } else closeOverlay(props().overlay); cx.stop_propagation(); } })
+      .on_key_down((e, cx) => { if (e.key === "escape") { if (this.remap || this.adding) { this.remap = null; this.adding = false; cx.notify(); } else closeOverlay(props().overlay); cx.stop_propagation(); } })
       .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().child("Ports"))
         .child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(head).children(rows).when(Boolean(empty), (el) => el.child(empty)))
-      .child(this.adding ? addRow : h_flex().child(addBtn));
+      .child(this.remap ? remapRow : this.adding ? addRow : h_flex().child(addBtn));
+  }
+
+  // ---------- right-click menu ----------
+  renderMenu() {
+    const t = theme();
+    const m = props().menu;
+    const item = (id, label, enabled, action) => h_flex().id(id).h(30).px(12).items_center().rounded(6).text_size(12.5)
+      .text_color(enabled ? t.foreground : t.dim).when(enabled, (el) => el.cursor_pointer().hover((s) => s.bg(t.raised)))
+      .on_click(() => { if (!enabled) return; closeOverlay(props().overlay); action(); }).child(label);
+    return v_flex().id("pf-menu").size_full().p(4).bg(t.popover)
+      .child(item("mi-open", "Open in Browser", !m.error, () => exec("open", [`http://localhost:${m.local}`])))
+      .child(item("mi-port", "Change Local Port…", true, () => setShared("pf.ui", { id: `${Date.now()}`, remap: { machine: m.machine, port: m.port, local: m.local } })))
+      .child(item("mi-stop", "Stop Forwarding", true, () => sendReq("close", m.machine, m.port)));
   }
 
   // ---------- render ----------
   render(cx) {
-    if (this.panel) return this.renderPanel(cx);
+    if (this.mode === "menu") return this.renderMenu();
+    if (this.mode === "panel") return this.renderPanel(cx);
     const t = theme();
     const st = shared("pf.state") ?? { rows: [] };
-    const ports = [...new Set(st.rows.map((r) => r.port))];
+    const ports = [...new Set(st.rows.map((r) => r.local ?? r.port))];
     const text = ports.length ? `⇄ Ports · ${ports.join(", ")}` : "⇄ Ports";
     return h_flex().id("pf-bar").size_full().px(14).items_center().bg(t.chrome).border_t(1).border_color(t.border)
       .text_size(11.8).text_color(t.muted).cursor_pointer().hover((s) => s.text_color(t.foreground))
