@@ -74,10 +74,7 @@ export default class PortForward extends View {
     cx.timer.every(500, (cx) => {
       this.n += 500;
       const fresh = (shared("pf.req") ?? []).filter((r) => !this.seen.has(r.id));
-      if (fresh.length) {
-        for (const r of fresh) { this.seen.add(r.id); if (r.op === "refresh") this.refreshId = r.id; else this.applyReq(r); }
-        this.kick(cx);
-      }
+      if (fresh.length) { for (const r of fresh) { this.seen.add(r.id); this.applyReq(r); } this.kick(cx); }
       else if (this.n % POLL_MS === 0) this.kick(cx);
     });
     this.kick(cx);
@@ -115,14 +112,11 @@ export default class PortForward extends View {
       try {
         do {
           this.again = false;
-          const rid = this.refreshId;
-          this.refreshId = null;
           const r = await hc(["machine", "ls", "--json"]);
           const list = (JSON.parse(r.stdout ?? r).machines ?? []).filter((x) => x.state === "connected" && !x.via && !x.temporary);
           await exec("mkdir", ["-p", SOCK_DIR]);
-          for (const mc of list) await (rid ? this.prune(mc) : this.sync(mc));
+          for (const mc of list) await this.sync(mc);
           this.publish(list.map((x) => x.name));
-          if (rid) setShared("pf.refreshed", rid);
           cx.notify();
         } while (this.again);
       } catch (e) { console.log("port-forward", String(e)); }
@@ -140,26 +134,6 @@ export default class PortForward extends View {
     const state = { rows, machines };
     const j = JSON.stringify(state);
     if (j !== this.last) { this.last = j; setShared("pf.state", state); }
-  }
-
-  async prune(mc) {
-    const s = this.m[mc.name];
-    if (!s) return;
-    let listening;
-    try {
-      const r = await exec("sh", ["-c", REMOTE], { on: mc.name, timeout: 10000 });
-      if (r.code !== 0) return;
-      listening = parseListening(r.stdout);
-    } catch { return; }
-    s.listening = listening;
-    const stale = [...s.fwd.keys()].filter((p) => !listening.has(p));
-    if (!stale.length) return;
-    for (const p of stale) {
-      const f = s.fwd.get(p);
-      if (!f.error) await ssh(["-S", s.sock, "-O", "cancel", "-L", fwdSpec(f.local, p), s.target], 5000).catch(() => {});
-      s.fwd.delete(p);
-    }
-    setShared("pf.user", (shared("pf.user") ?? []).filter((u) => !(u.machine === mc.name && stale.includes(u.port))));
   }
 
   async sync(mc) {
@@ -228,10 +202,8 @@ export default class PortForward extends View {
     this.input.on("change", (_e, cx) => { this.error = ""; cx.notify(); });
     this.handle = cx.focus_handle();
     this.remap = null;                                   // {machine, port, local}: editing a local port
-    this.refreshing = null;
     this.uiId = shared("pf.ui")?.id;
     cx.timer.every(150, (cx) => {                        // the right-click menu asks us to edit a port via shared state
-      if (this.refreshing && (shared("pf.refreshed") === this.refreshing || Date.now() - this.refreshAt > 15000)) { this.refreshing = null; cx.notify(); }
       const u = shared("pf.ui");
       if (!u?.remap || u.id === this.uiId) return;
       this.uiId = u.id; this.remap = u.remap; this.adding = false; this.error = "";
@@ -242,12 +214,6 @@ export default class PortForward extends View {
   }
 
   send(op, machine, port, extra) { sendReq(op, machine, port, extra); }
-
-  refresh() {
-    sendReq("refresh");
-    this.refreshing = shared("pf.req").at(-1).id;
-    this.refreshAt = Date.now();
-  }
 
   submit() {
     if (this.remap) {
@@ -320,17 +286,12 @@ export default class PortForward extends View {
         .cursor_pointer().on_click((_e, cx) => { this.submit(); cx.notify(); }).child("Save"))
       .child(div().id("pf-rcancel").text_size(12).text_color(t.dim).cursor_pointer().on_click((_e, cx) => { this.remap = null; this.error = ""; cx.notify(); }).child("Cancel"))
       .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)));
-    const refreshBtn = h_flex().id("pf-refresh").h(30).px(12).items_center().rounded(8).border_1().border_color(t.input).bg(t.raised)
-      .text_size(12.5).text_color(this.refreshing ? t.dim : t.foreground)
-      .when(!this.refreshing, (el) => el.cursor_pointer().hover((s) => s.opacity(0.88)))
-      .on_click((_e, cx) => { if (this.refreshing) return; this.refresh(); cx.notify(); })
-      .child(this.refreshing ? "Refreshing…" : "↻ Refresh");
     return v_flex().id("pf-panel").track_focus(this.handle).size_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
       .on_key_down((e, cx) => { if (e.key === "escape") { if (this.remap || this.adding) { this.remap = null; this.adding = false; cx.notify(); } else closeOverlay(props().overlay); cx.stop_propagation(); } })
       .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().child("Ports"))
         .child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(head).children(rows).when(Boolean(empty), (el) => el.child(empty)))
-      .child(this.remap ? remapRow : this.adding ? addRow : h_flex().gap(8).child(addBtn).child(refreshBtn));
+      .child(this.remap ? remapRow : this.adding ? addRow : h_flex().child(addBtn));
   }
 
   // ---------- right-click menu ----------
