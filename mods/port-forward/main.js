@@ -1,8 +1,10 @@
 // Auto port forwarding for ssh machines (like VS Code / Cursor), with a Ports panel.
 //
 // Bar mode (the layout block): every few seconds, asks each ssh machine which TCP ports
-// listen on loopback/any and `ssh -L p:127.0.0.1:p`s the new ones to the same local port
-// through one ControlMaster per machine. Clicking the bar opens the Ports panel.
+// listen on loopback/any. Only ports opened by a process started from a herdr terminal
+// (a descendant of `herdr-core hold`) are auto-forwarded, plus ports the user forwards,
+// via `ssh -L p:127.0.0.1:p` through one ControlMaster per machine.
+// Clicking the bar opens the Ports panel.
 // Panel mode (props().panel): a table of forwards (port, address, process, origin) with
 // close buttons and an Add Port row. It talks to the bar copy through shared state:
 //   pf.state  rows published by the bar        pf.req   requests queued by the panel
@@ -28,17 +30,25 @@ out=$(ss -H -ltnp 2>/dev/null)
 if [ -n "$out" ]; then echo "$out"; else
   cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk '$4=="0A"{split($2,a,":"); print a[2]}' | sort -u | while read h; do echo "LISTEN 0 0 0.0.0.0:$((16#$h)) 0.0.0.0:*"; done
 fi
+echo --herdr--
+ps -e -o pid= -o ppid= -o args= 2>/dev/null | awk '{pp[$1]=$2; if ($3 ~ /herdr-core$/ && $4 == "hold") root[$1]=1}
+  END {for (p in pp) {q=p; for (n=0; n<64 && q>1; n++) {if (q in root) {print p; break}; q=pp[q]}}}'
 `;
 
 function parseListening(text) {
-  const out = new Map();
-  for (const line of text.split("\n")) {
+  const [sockets, tree = ""] = text.split("--herdr--");
+  const herdrPids = new Set(tree.split(/\s+/).filter(Boolean));
+  const out = new Map();                                                         // port -> {proc, herdr}
+  for (const line of sockets.split("\n")) {
     const tok = line.trim().split(/\s+/);
     const m = (tok[3] ?? "").match(/^(?:127\.0\.0\.1|0\.0\.0\.0|\*|\[::1?\]|::):(\d+)$/);
     if (!m) continue;
     const p = Number(m[1]);
-    const pm = tok.slice(5).join(" ").match(/\("([^"]+)",pid=(\d+)/);
-    if (!out.has(p) || pm) out.set(p, pm ? `${pm[1]} (${pm[2]})` : "");
+    const users = tok.slice(5).join(" ");
+    const pm = users.match(/\("([^"]+)",pid=(\d+)/);
+    const herdr = [...users.matchAll(/pid=(\d+)/g)].some((x) => herdrPids.has(x[1]));
+    const prev = out.get(p);
+    if (!prev || pm) out.set(p, { proc: pm ? `${pm[1]} (${pm[2]})` : prev?.proc ?? "", herdr: herdr || Boolean(prev?.herdr) });
   }
   return out;
 }
@@ -106,10 +116,11 @@ export default class PortForward extends View {
         do {
           this.again = false;
           const rid = this.refreshId;
+          this.refreshId = null;
           const r = await hc(["machine", "ls", "--json"]);
           const list = (JSON.parse(r.stdout ?? r).machines ?? []).filter((x) => x.state === "connected" && !x.via && !x.temporary);
           await exec("mkdir", ["-p", SOCK_DIR]);
-          for (const mc of list) await this.sync(mc);
+          for (const mc of list) await (rid ? this.prune(mc) : this.sync(mc));
           this.publish(list.map((x) => x.name));
           if (rid) setShared("pf.refreshed", rid);
           cx.notify();
@@ -123,12 +134,32 @@ export default class PortForward extends View {
     const rows = [];
     for (const [machine, s] of Object.entries(this.m)) {
       if (!machines.includes(machine)) continue;
-      for (const [port, f] of s.fwd) rows.push({ machine, port, local: f.local, proc: s.listening.get(port) ?? "", origin: f.origin, error: f.error ?? null });
+      for (const [port, f] of s.fwd) rows.push({ machine, port, local: f.local, proc: s.listening.get(port)?.proc ?? "", origin: f.origin, error: f.error ?? null });
     }
     rows.sort((a, b) => a.port - b.port);
     const state = { rows, machines };
     const j = JSON.stringify(state);
     if (j !== this.last) { this.last = j; setShared("pf.state", state); }
+  }
+
+  async prune(mc) {
+    const s = this.m[mc.name];
+    if (!s) return;
+    let listening;
+    try {
+      const r = await exec("sh", ["-c", REMOTE], { on: mc.name, timeout: 10000 });
+      if (r.code !== 0) return;
+      listening = parseListening(r.stdout);
+    } catch { return; }
+    s.listening = listening;
+    const stale = [...s.fwd.keys()].filter((p) => !listening.has(p));
+    if (!stale.length) return;
+    for (const p of stale) {
+      const f = s.fwd.get(p);
+      if (!f.error) await ssh(["-S", s.sock, "-O", "cancel", "-L", fwdSpec(f.local, p), s.target], 5000).catch(() => {});
+      s.fwd.delete(p);
+    }
+    setShared("pf.user", (shared("pf.user") ?? []).filter((u) => !(u.machine === mc.name && stale.includes(u.port))));
   }
 
   async sync(mc) {
@@ -147,7 +178,7 @@ export default class PortForward extends View {
 
     const users = new Set((shared("pf.user") ?? []).filter((u) => u.machine === mc.name).map((u) => u.port));
     const want = new Map();                                                      // port -> origin
-    for (const p of listening.keys()) if (p >= MIN_PORT && !IGNORE.has(p) && !s.closed.has(p)) want.set(p, "auto");
+    for (const [p, l] of listening) if (l.herdr && p >= MIN_PORT && !IGNORE.has(p) && !s.closed.has(p)) want.set(p, "auto");
     for (const p of users) want.set(p, "user");
 
     let alive = !fresh && await ssh(["-S", s.sock, "-O", "check", s.target], 3000).then(() => true, () => false);
@@ -265,7 +296,7 @@ export default class PortForward extends View {
           .on_click(() => this.send("close", r.machine, r.port)).child("✕"));
     });
     const empty = st.rows.length ? null : div().px(8).py(18).text_size(12).text_color(t.dim)
-      .child(st.machines.length ? "No forwarded ports yet. Start a server on a remote machine, or add one." : "Connect an ssh machine to forward its ports.");
+      .child(st.machines.length ? "No forwarded ports yet. Start a server in a herdr terminal, or add one." : "Connect an ssh machine to forward its ports.");
     const addBtn = h_flex().id("pf-add").h(30).px(12).items_center().rounded(8).border_1().border_color(t.input).bg(t.raised)
       .text_size(12.5).text_color(t.foreground).cursor_pointer().hover((s) => s.opacity(0.88))
       .on_click((_e, cx) => { this.adding = true; cx.notify(); cx.timer.after(50, () => this.input.focus()); }).child("+ Add Port");
