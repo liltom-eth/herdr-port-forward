@@ -1,6 +1,6 @@
 # Port Forward
 
-Auto port forwarding for ssh machines, like VS Code and Cursor. Start a server (or run `aws sso login`) on a remote machine and its port appears on `localhost` within seconds. A thin bar at the bottom of the window shows what is forwarded; clicking it opens a Ports panel with a table of every forward, and right-clicking a row gives a menu.
+Auto port forwarding for ssh machines, like VS Code and Cursor. Start a server (or run `aws sso login`) in a herdr terminal on a remote machine and its port appears on `localhost` within seconds. Other listening ports are not forwarded (add them by hand). A thin bar at the bottom of the window shows what is forwarded; clicking it opens a Ports panel with a table of every forward, and right-clicking a row gives a menu.
 
 ![Port Forward](preview.png)
 
@@ -13,15 +13,16 @@ Auto port forwarding for ssh machines, like VS Code and Cursor. Start a server (
 | Port | Forwarded Address | Running Process | Origin | (✕) |
 |---|---|---|---|---|
 
-Columns are 96px, 170px, flexible, 130px and 30px. Header row is 30px, 11.5px `dim` text, 1px `border` underneath. Rows are 34px, 12.5px text, `raised` background on hover. Port is the remote port (plus the machine name in 10.5px `dim` when more than one machine is connected). Address is `localhost:<local port>` in `accent`, or the error in `blocked` color when the forward failed. Process is `name (pid)` in `muted`. Origin is `Auto Forwarded` or `User Forwarded` in `muted`. Empty state: "No forwarded ports yet. Start a server on a remote machine, or add one." (or "Connect an ssh machine to forward its ports."). The last element is a 30px bordered `+ Add Port` button.
+Columns are 96px, 170px, flexible, 130px and 30px. Header row is 30px, 11.5px `dim` text, 1px `border` underneath. Rows are 34px, 12.5px text, `raised` background on hover. Port is the remote port (plus the machine name in 10.5px `dim` when more than one machine is connected). Address is `localhost:<local port>` in `accent`, the error in `blocked` color when the forward failed. Process is `name (pid)` in `muted`. Origin is `Auto Forwarded` or `User Forwarded` in `muted`. Empty state: "No forwarded ports yet. Start a server in a herdr terminal, or add one." (or "Connect an ssh machine to forward its ports."). The last row holds a 30px bordered `+ Add Port` button and a matching `↻ Refresh` button.
 
 **The row menu** is a 210x118 popup (`popover`, 4px padding) with three 30px items: Open in Browser, Change Local Port…, Stop Forwarding.
 
 ## How it behaves
 
-- **Detection.** Every 3 seconds, for each machine from `hc machine ls --json` that is `connected`, not `via`, not `temporary`, run `ss -H -ltnp` on it (fallback: `/proc/net/tcp{,6}` printed in `ss`'s shape). Keep listeners bound to `127.0.0.1`, `0.0.0.0`, `*`, `[::1]`, `[::]` or `::`. Process comes from `users:(("name",pid=N`; it is blank for other users' processes. Auto-forward only ports 1024-65535 (a top-level `IGNORE` set excludes more).
+- **Detection.** Every 3 seconds, for each machine from `hc machine ls --json` that is `connected`, not `via`, not `temporary`, run `ss -H -ltnp` on it (fallback: `/proc/net/tcp{,6}` printed in `ss`'s shape). Keep listeners bound to `127.0.0.1`, `0.0.0.0`, `*`, `[::1]`, `[::]` or `::`. Process comes from `users:(("name",pid=N`; it is blank for other users' processes. The same script prints the pids descending from any `herdr-core hold` process (the process herdr terminals run under, via `ps -e -o pid= -o ppid= -o args=`); a port 1024-65535 is auto-forwarded only when one of its pids is among them (a top-level `IGNORE` set excludes more). Other ports are not shown.
 - **Forwarding.** One ssh ControlMaster per machine: `ssh -fN -o ControlMaster=yes -o ControlPersist=yes -o ControlPath=/tmp/herdr-pf/<first 12 chars of machine id>.sock -o BatchMode=yes -o ServerAliveInterval=15 -o ExitOnForwardFailure=no <target>` (`target` from `hc machine ls`). Each forward is `ssh -S <sock> -O forward -L 127.0.0.1:<local>:127.0.0.1:<remote> <target>`; cancelling uses `-O cancel` with the same spec. On first sync per machine, any master left by an earlier run is stopped with `-O exit` so forwards start clean; on close the bar copy stops every master.
 - **Auto forwards** use the same local port as the remote one and raise an info toast ("Forwarded port 8801", body `<machine> → localhost:8801`). When the remote stops listening, the forward is cancelled and the row disappears. A forward that fails (local port in use, ssh refuses) is kept as an error row, with one warning toast, and is retried only when its local port changes.
+- **Refresh** queues a `refresh` request; the bar removes rows whose remote port no longer listens (cancelling their forwards, and dropping user-forwarded ones from `pf.user`) without opening any new forwards, then writes the request id to shared `pf.refreshed`. The button reads `Refreshing…` (disabled) until then, or 15s at most.
 - **Add Port** reveals a text input (and one chip per machine when several are connected), a Forward button and Cancel. Enter submits. The port must be an integer 1-65535. A user forward is made even if nothing listens remotely yet, is never auto-cancelled, and is saved (shared `pf.user`).
 - **Row menu** (right-click, opened at the click's `position`):
   - Open in Browser runs `open http://localhost:<local>` (disabled on error rows). Clicking the address does the same.
@@ -36,7 +37,7 @@ One mod, `mods/port-forward/` (`main.js`, `mod.json`), no keys, no layout. One c
 The **bar copy owns all ssh work**. The panel and menu never run ssh; they talk to it through shared state:
 
 - `pf.state` `{rows: [{machine, port, local, proc, origin: "auto"|"user", error}], machines: [names]}`, published by the bar (only when changed) and read by the panel and bar text.
-- `pf.req` an array of `{id, op: "add"|"close"|"remap", machine, port, local?}`, appended by the panel/menu (keep the last 20). The bar polls it every 500ms and runs unseen ids; ids already present when the bar starts are marked seen so a restart does not replay them.
+- `pf.req` an array of `{id, op: "add"|"close"|"remap"|"refresh", machine, port, local?}`, appended by the panel/menu (keep the last 20). The bar polls it every 500ms and runs unseen ids; ids already present when the bar starts are marked seen so a restart does not replay them.
 - `pf.user` `[{machine, port}]` user-forwarded ports; `pf.map` `[{machine, port, local}]` local-port overrides; `pf.ui` `{id, remap: {machine, port, local}}` how the menu asks the panel to show the Change Local Port input (the panel polls it every 150ms).
 
 Uses `exec`, `hc`, `theme`, `notify`, `shared`, `setShared`, `props`, `openOverlay`, `closeOverlay` from `herdr`; `View`, `div` from `gpui-kit`; `v_flex`, `h_flex`, `InputState`, `Input` from `gpui-base`. Programs run: `ssh`, `sh` (remote `ss` script, via `exec(..., {on: machine})`), `mkdir`, `open`, `hc`.
@@ -50,14 +51,14 @@ Uses `exec`, `hc`, `theme`, `notify`, `shared`, `setShared`, `props`, `openOverl
 - The ControlMaster must be started with `ControlPersist=yes` (it daemonizes). A plain `-fNM` master dies when `exec` returns.
 - Machine names are whatever the user called them and can be renamed; always read them live from `hc machine ls`. Saved `pf.user`/`pf.map` entries are keyed by name and do not follow a rename.
 - Needs key-based ssh from this computer to the machine's `target` (`BatchMode`). Password-only machines get no forwards. Forwards bind `127.0.0.1` only.
-- Ports already listening when the mod starts are forwarded too. Privileged local ports (below 1024) can fail without root and show as an error row.
+- Ports already listening when the mod starts are forwarded too, if they belong to a herdr terminal. Processes outside herdr terminals (editor servers, sandboxes, daemons) are never auto-forwarded; on machines without `ss`, nothing is auto-forwarded. Privileged local ports (below 1024) can fail without root and show as an error row.
 - A missing process name is normal for services running as another user.
 - `/tmp/herdr-pf/` holds the control sockets. Unix only.
 
 ## Done when
 
 - `herdr-app check mods/port-forward` passes, and `herdr-app status` shows no errors with the block in a layout.
-- With one ssh machine connected, starting `python3 -m http.server 8801` there makes `curl localhost:8801` return 200 within about 10 seconds, the panel shows an `Auto Forwarded` row with `python3 (<pid>)`, and the bar reads `⇄ Ports · 8801`.
+- With one ssh machine connected, starting `python3 -m http.server 8801` in a herdr terminal there makes `curl localhost:8801` return 200 within about 10 seconds, the panel shows an `Auto Forwarded` row with `python3 (<pid>)`, and the bar reads `⇄ Ports · 8801`.
 - Stopping that server removes the row and makes `curl localhost:8801` fail.
 - Add Port with `9300` adds a `User Forwarded` row and `localhost:9300` starts listening locally (`lsof -iTCP:9300 -sTCP:LISTEN`), even with nothing on the remote.
 - Change Local Port on the 8801 row to `28801` makes `curl localhost:28801` return 200, `localhost:8801` stop responding, and the address read `localhost:28801`.
