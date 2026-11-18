@@ -17,6 +17,8 @@ const POLL_MS = 3000;
 const MIN_PORT = 1024;                 // auto-forward skips privileged ports
 const IGNORE = new Set([]);            // ports never auto-forwarded
 const SOCK_DIR = "/tmp/herdr-pf";
+const SYNC_MS = 60000;
+const STUCK_MS = 120000;
 
 const ssh = async (args, timeout) => {
   const r = await exec("ssh", args, { timeout });
@@ -52,6 +54,11 @@ function parseListening(text) {
   }
   return out;
 }
+
+const withTimeout = (cx, promise, ms, what) => Promise.race([
+  promise,
+  cx.sleep(ms).then(() => { throw new Error(`${what} timed out after ${ms}ms`); }),
+]);
 
 const fwdSpec = (local, remote) => `127.0.0.1:${local}:127.0.0.1:${remote}`;
 
@@ -106,21 +113,28 @@ export default class PortForward extends View {
   }
 
   kick(cx) {
-    if (this.busy) { this.again = true; return; }
+    if (this.busy && Date.now() - this.busySince < STUCK_MS) { this.again = true; return; }
+    const gen = this.gen = (this.gen ?? 0) + 1;
     this.busy = true;
+    this.busySince = Date.now();
     cx.spawn(async (cx) => {
       try {
         do {
           this.again = false;
-          const r = await hc(["machine", "ls", "--json"]);
+          const r = await withTimeout(cx, hc(["machine", "ls", "--json"]), 10000, "hc machine ls");
+          if (gen !== this.gen) return;
           const list = (JSON.parse(r.stdout ?? r).machines ?? []).filter((x) => x.state === "connected" && !x.via && !x.temporary);
-          await exec("mkdir", ["-p", SOCK_DIR]);
-          for (const mc of list) await this.sync(mc);
+          await exec("mkdir", ["-p", SOCK_DIR], { timeout: 5000 });
+          for (const mc of list) {
+            if (gen !== this.gen) return;
+            await withTimeout(cx, this.sync(mc), SYNC_MS, `sync ${mc.name}`).catch((e) => console.log("port-forward", String(e)));
+          }
+          if (gen !== this.gen) return;
           this.publish(list.map((x) => x.name));
           cx.notify();
         } while (this.again);
       } catch (e) { console.log("port-forward", String(e)); }
-      this.busy = false;
+      if (gen === this.gen) this.busy = false;
     });
   }
 
